@@ -1,0 +1,53 @@
+name: Quinlan CI
+
+on:
+  push:
+    branches: ["release-3.5.0_dev"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push images
+        run: |
+          IMAGE_OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          TAG=$(git rev-parse --short HEAD)-$(date '+%Y%m%d%H%M%S')
+
+          # devops-apiserver
+          APISERVER_IMAGE=ghcr.io/${IMAGE_OWNER_LOWER}/devops-apiserver
+          docker build -t ${APISERVER_IMAGE}:${TAG} -t ${APISERVER_IMAGE}:latest \
+            -f config/dockerfiles/apiserver/Dockerfile .
+          docker push ${APISERVER_IMAGE}:${TAG}
+          docker push ${APISERVER_IMAGE}:latest
+
+          # devops-controller
+          CONTROLLER_IMAGE=ghcr.io/${IMAGE_OWNER_LOWER}/devops-controller
+          docker build -t ${CONTROLLER_IMAGE}:${TAG} -t ${CONTROLLER_IMAGE}:latest \
+            -f config/dockerfiles/controller-manager/Dockerfile .
+          docker push ${CONTROLLER_IMAGE}:${TAG}
+          docker push ${CONTROLLER_IMAGE}:latest
+
+          # devops-tools
+          TOOLS_IMAGE=ghcr.io/${IMAGE_OWNER_LOWER}/devops-tools
+          docker build -t ${TOOLS_IMAGE}:${TAG} -t ${TOOLS_IMAGE}:latest \
+            -f config/dockerfiles/tools/Dockerfile .
+          docker push ${TOOLS_IMAGE}:${TAG}
+          docker push ${TOOLS_IMAGE}:latest
