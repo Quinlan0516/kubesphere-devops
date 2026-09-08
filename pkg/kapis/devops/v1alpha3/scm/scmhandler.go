@@ -48,7 +48,18 @@ func (h *handler) verify(request *restful.Request, response *restful.Response) {
 	secretNamespace := request.QueryParameter("secretNamespace")
 	server := common.GetQueryParameter(request, queryParameterServer)
 
-	_, code, err := h.getOrganizations(scm, server, secretName, secretNamespace, 1, 1, false)
+	var code int
+	var err error
+
+	// Bitbucket Cloud HTTP Access Tokens use Bearer auth, which is not
+	// supported by go-scm's Organizations.List (calls 2.0/workspaces).
+	// Use Users.Find (calls 2.0/user) instead for token verification,
+	// as it supports Bearer Token authentication.
+	if scm == "bitbucket_cloud" {
+		code, err = h.verifyWithUserFind(scm, server, secretName, secretNamespace)
+	} else {
+		_, code, err = h.getOrganizations(scm, server, secretName, secretNamespace, 1, 1, false)
+	}
 
 	response.Header().Set(restful.HEADER_ContentType, restful.MIME_JSON)
 	verifyResult := git.VerifyResult(err, code)
@@ -56,18 +67,52 @@ func (h *handler) verify(request *restful.Request, response *restful.Response) {
 	_ = response.WriteAsJson(verifyResult)
 }
 
-func (h *handler) getOrganizations(scm, server, secret, namespace string, page, size int, includeUser bool) (orgs []*goscm.Organization, code int, err error) {
-	factory := git.NewClientFactory(scm, &v1.SecretReference{
+// verifyWithUserFind verifies SCM credentials using Users.Find instead of
+// Organizations.List. Used for providers where the organizations endpoint
+// does not support the credential type (e.g. Bitbucket Cloud Bearer Token).
+func (h *handler) verifyWithUserFind(scm, server, secret, namespace string) (code int, err error) {
+	f := git.NewClientFactory(scm, &v1.SecretReference{
 		Namespace: namespace, Name: secret,
 	}, h.Client)
-	factory.Server = server
+	f.Server = server
+
+	var c *goscm.Client
+	if c, err = f.GetClient(); err == nil {
+		var resp *goscm.Response
+		if _, resp, err = c.Users.Find(context.Background()); err == nil {
+			code = resp.Status
+		} else {
+			code = 101
+		}
+	} else {
+		code = 100
+	}
+	return
+}
+
+func (h *handler) getOrganizations(scm, server, secret, namespace string, page, size int, includeUser bool) (orgs []*goscm.Organization, code int, err error) {
+	clientFactory := git.NewClientFactory(scm, &v1.SecretReference{
+		Namespace: namespace, Name: secret,
+	}, h.Client)
+	clientFactory.Server = server
 
 	ctx := context.Background()
 	var c *goscm.Client
-	if c, err = factory.GetClient(); err == nil {
+	if c, err = clientFactory.GetClient(); err == nil {
 		var resp *goscm.Response
 
-		if orgs, resp, err = c.Organizations.List(ctx, &goscm.ListOptions{Size: size, Page: page}); err == nil {
+		// go-scm's bitbucket Organizations.List calls GET 2.0/workspaces,
+		// which does not support Bitbucket Cloud HTTP Access Tokens (Bearer).
+		// Fall back to GET 2.0/user/workspaces, which does support Bearer auth.
+		// For other providers, use the standard Organizations.List.
+		if scm == "bitbucket_cloud" {
+			orgs, resp, err = git.ListBitbucketUserWorkspaces(ctx, c)
+			if err == nil {
+				code = resp.Status
+			} else {
+				code = 101
+			}
+		} else if orgs, resp, err = c.Organizations.List(ctx, &goscm.ListOptions{Size: size, Page: page}); err == nil {
 			code = resp.Status
 		} else {
 			code = 101

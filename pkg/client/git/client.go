@@ -18,10 +18,14 @@ package git
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 
 	goscm "github.com/jenkins-x/go-scm/scm"
+	"github.com/jenkins-x/go-scm/scm/driver/bitbucket"
 	"github.com/jenkins-x/go-scm/scm/factory"
+	"github.com/jenkins-x/go-scm/scm/transport"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"kubesphere.io/devops/pkg/api/devops/v1alpha3"
@@ -46,6 +50,12 @@ func NewClientFactory(provider string, secretRef *v1.SecretReference, k8sClient 
 	}
 }
 
+// bitbucketTokenAuthUsername is the special username placeholder used when
+// authenticating Bitbucket Cloud with an HTTP Access Token (Bearer token).
+// Jenkins and other tools use this convention: the username is set to this
+// constant and the password field holds the actual token value.
+const bitbucketTokenAuthUsername = "x-bitbucket-api-token-auth"
+
 // GetClient returns the git client with auth
 func (c *ClientFactory) GetClient() (client *goscm.Client, err error) {
 	provider := c.provider
@@ -67,6 +77,29 @@ func (c *ClientFactory) GetClient() (client *goscm.Client, err error) {
 			return
 		}
 	}
+
+	// Bitbucket Cloud rejects Basic Auth for HTTP Access Tokens unless the
+	// username is a registered Atlassian email. When Jenkins-style credentials
+	// are used (username = "x-bitbucket-api-token-auth", password = token),
+	// we bypass go-scm factory and send the token as a Bearer token instead.
+	// This keeps the credential format consistent with Jenkins SCM usage.
+	if provider == "bitbucketcloud" && username == bitbucketTokenAuthUsername {
+		server := c.Server
+		if server == "" || server == "https://bitbucket.org" {
+			server = "https://api.bitbucket.org"
+		}
+		client, err = bitbucket.New(server)
+		if err != nil {
+			return
+		}
+		client.Client = &http.Client{
+			Transport: &transport.BearerToken{
+				Token: token,
+			},
+		}
+		return
+	}
+
 	client, err = factory.NewClient(provider, c.Server, token, func(scmClient *goscm.Client) {
 		scmClient.Username = username
 	})
@@ -107,4 +140,56 @@ func (c *ClientFactory) getSecret(ref *v1.SecretReference) (secret *v1.Secret, e
 // ResourceGetter represent the interface for getting Kubernetes resource
 type ResourceGetter interface {
 	Get(ctx context.Context, key types.NamespacedName, obj client.Object) error
+}
+
+// bitbucketUserWorkspacesResponse is the API response from GET 2.0/user/workspaces,
+// which supports Bitbucket Cloud HTTP Access Token (Bearer) authentication.
+// The response has workspace info nested under a "workspace" key in each value.
+type bitbucketUserWorkspacesResponse struct {
+	Values []struct {
+		Workspace struct {
+			Slug string `json:"slug"`
+			Name string `json:"name"`
+		} `json:"workspace"`
+	} `json:"values"`
+}
+
+// ListBitbucketUserWorkspaces calls GET 2.0/user/workspaces using the go-scm
+// client's existing HTTP transport (Bearer Token configured). This endpoint
+// supports Bitbucket Cloud HTTP Access Tokens, unlike 2.0/workspaces which
+// does not support Bearer auth and is used by go-scm's Organizations.List.
+func ListBitbucketUserWorkspaces(ctx context.Context, c *goscm.Client) ([]*goscm.Organization, *goscm.Response, error) {
+	req := &goscm.Request{
+		Method: "GET",
+		Path:   "2.0/user/workspaces",
+	}
+	resp, err := c.Do(ctx, req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	scmResp := &goscm.Response{
+		Status: resp.Status,
+		Header: resp.Header,
+	}
+
+	if resp.Status > 299 {
+		return nil, scmResp, fmt.Errorf("%s", http.StatusText(resp.Status))
+	}
+
+	var result bitbucketUserWorkspacesResponse
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, scmResp, err
+	}
+
+	orgs := make([]*goscm.Organization, 0, len(result.Values))
+	for _, v := range result.Values {
+		slug := v.Workspace.Slug
+		orgs = append(orgs, &goscm.Organization{
+			Name:   slug,
+			Avatar: fmt.Sprintf("https://bitbucket.org/workspaces/%s/avatar", slug),
+		})
+	}
+	return orgs, scmResp, nil
 }
