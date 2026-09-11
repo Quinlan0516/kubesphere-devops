@@ -208,21 +208,7 @@ func (c *Controller) syncHandler(key string) error {
 		klog.Error(err, fmt.Sprintf("could not split copyPipeline meta %s ", key))
 		return nil
 	}
-	//namespace, err := c.namespaceLister.Get(nsName)
-	//if err != nil {
-	//	if errors.IsNotFound(err) {
-	//		klog.Info(fmt.Sprintf("namespace '%s' in work queue no longer exists ", key))
-	//		return nil
-	//	}
-	//	klog.V(8).Info(err, fmt.Sprintf("could not get namespace %s ", key))
-	//	return err
-	//}
-	// TODO this is the KubeSphere core part instead of the DevOps part
-	//if !isDevOpsProjectAdminNamespace(namespace) {
-	//	err := fmt.Errorf("cound not create copyPipeline in normal namespaces %s", namespace.Name)
-	//	klog.Warning(err)
-	//	return err
-	//}
+
 	pipeline, err := c.devOpsProjectLister.Pipelines(nsName).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -241,33 +227,43 @@ func (c *Controller) syncHandler(key string) error {
 			copyPipeline.Annotations = map[string]string{}
 		}
 
-		//If the sync is successful, return handle
-		if state, ok := copyPipeline.Annotations[devopsv1alpha3.PipelineSyncStatusAnnoKey]; ok && state == constants.StatusSuccessful {
-			specHash := utils.ComputeHash(copyPipeline.Spec)
-			oldHash := copyPipeline.Annotations[devopsv1alpha3.PipelineSpecHash] // don't need to check if it's nil, only compare if they're different
-			if specHash == oldHash {
-				klog.V(9).Info(fmt.Sprintf("%s/%s has no changes in spec", copyPipeline.Namespace, copyPipeline.Name))
-				// it was synced successfully, and there's any change with the Pipeline spec, skip this round
-				return nil
-			}
-			copyPipeline.Annotations[devopsv1alpha3.PipelineSpecHash] = specHash
-		}
-
 		// https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#finalizers
 		if !sliceutil.HasString(copyPipeline.ObjectMeta.Finalizers, devopsv1alpha3.PipelineFinalizerName) {
 			copyPipeline.ObjectMeta.Finalizers = append(copyPipeline.ObjectMeta.Finalizers, devopsv1alpha3.PipelineFinalizerName)
 		}
 
-		// Check pipeline config exists, otherwise we will create it.
-		// if pipeline exists, check & update config
+		// Check pipeline config exists in Jenkins first, this handles the case when Jenkins is rebuilt
 		jenkinsPipeline, err := c.devopsClient.GetProjectPipelineConfig(nsName, pipeline.Name)
-		if err == nil {
+		jobExistsInJenkins := err == nil
+
+		// Calculate spec hash for change detection
+		specHash := utils.ComputeHash(copyPipeline.Spec)
+		oldHash := copyPipeline.Annotations[devopsv1alpha3.PipelineSpecHash]
+		specChanged := specHash != oldHash
+
+		// If sync was successful, job exists in Jenkins, and spec hasn't changed, skip this round
+		if state, ok := copyPipeline.Annotations[devopsv1alpha3.PipelineSyncStatusAnnoKey]; ok && state == constants.StatusSuccessful {
+			if jobExistsInJenkins && !specChanged {
+				// Also verify the config matches
+				if reflect.DeepEqual(jenkinsPipeline.Spec, copyPipeline.Spec) {
+					klog.V(9).Info(fmt.Sprintf("%s/%s has no changes and job exists in Jenkins, skip sync", copyPipeline.Namespace, copyPipeline.Name))
+					return nil
+				}
+			}
+		}
+
+		// Update spec hash
+		copyPipeline.Annotations[devopsv1alpha3.PipelineSpecHash] = specHash
+
+		// Sync pipeline to Jenkins: create if not exists, update if config differs
+		if jobExistsInJenkins {
 			if !reflect.DeepEqual(jenkinsPipeline.Spec, copyPipeline.Spec) {
 				_, err := c.devopsClient.UpdateProjectPipeline(nsName, copyPipeline)
 				if err != nil {
 					klog.V(8).Info(err, fmt.Sprintf("failed to update pipeline config %s ", key))
 					return err
 				}
+				klog.Infof("updated pipeline %s in Jenkins", key)
 			} else {
 				klog.V(8).Info(fmt.Sprintf("nothing was changed, pipeline '%v'", copyPipeline.Spec))
 			}
@@ -277,9 +273,10 @@ func (c *Controller) syncHandler(key string) error {
 				klog.V(8).Info(err, fmt.Sprintf("failed to create copyPipeline %s ", key))
 				return err
 			}
+			klog.Infof("created pipeline %s in Jenkins (job was missing)", key)
 		}
 
-		//If there is no early return, then the sync is successful.
+		// Mark sync as successful
 		copyPipeline.Annotations[devopsv1alpha3.PipelineSyncStatusAnnoKey] = constants.StatusSuccessful
 	} else {
 		// Finalizers processing logic

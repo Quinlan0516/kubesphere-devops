@@ -214,11 +214,6 @@ func (c *Controller) syncHandler(key string) error {
 	copyProject := project.DeepCopy()
 	// DeletionTimestamp.IsZero() means DevOps project has not been deleted.
 	if project.ObjectMeta.DeletionTimestamp.IsZero() {
-		//If the sync is successful, return handle
-		if state, ok := project.Annotations[devopsv1alpha3.DevOpeProjectSyncStatusAnnoKey]; ok && state == constants.StatusSuccessful {
-			return nil
-		}
-
 		// Use Finalizers to sync DevOps status when DevOps project was deleted
 		// https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#finalizers
 		if !sliceutil.HasString(project.ObjectMeta.Finalizers, devopsv1alpha3.DevOpsProjectFinalizerName) {
@@ -315,14 +310,27 @@ func (c *Controller) syncHandler(key string) error {
 		//	return err
 		//}
 
-		// Check project exists, otherwise we will create it.
+		// Check project exists in Jenkins, otherwise we will create it.
+		// This also handles the case when Jenkins is rebuilt.
 		_, err := c.devopsClient.GetDevOpsProject(copyProject.Status.AdminNamespace)
-		if err != nil {
+		projectExistsInJenkins := err == nil
+
+		// If sync was successful and project exists in Jenkins, skip this round
+		if state, ok := project.Annotations[devopsv1alpha3.DevOpeProjectSyncStatusAnnoKey]; ok && state == constants.StatusSuccessful {
+			if projectExistsInJenkins {
+				return nil
+			}
+			// Project doesn't exist in Jenkins, need to recreate
+			klog.Infof("devopsproject %s exists in K8s but not in Jenkins, will recreate", key)
+		}
+
+		if !projectExistsInJenkins {
 			_, err := c.devopsClient.CreateDevOpsProject(copyProject.Status.AdminNamespace)
 			if err != nil {
-				klog.V(8).Info(err, fmt.Sprintf("failed to get project %s ", key))
+				klog.V(8).Info(err, fmt.Sprintf("failed to create project %s in Jenkins", key))
 				return err
 			}
+			klog.Infof("created devopsproject %s in Jenkins", key)
 		}
 
 		//If there is no early return, then the sync is successful.

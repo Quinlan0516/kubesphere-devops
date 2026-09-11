@@ -245,31 +245,39 @@ func (c *Controller) syncHandler(key string) error {
 			copySecret.Annotations = map[string]string{}
 		}
 
-		//If the sync is successful, return handle
-		if state, ok := copySecret.Annotations[devopsv1alpha3.CredentialSyncStatusAnnoKey]; ok && state == constants.StatusSuccessful {
-			specHash := utils.ComputeHash(copySecret.Data)
-			oldHash := copySecret.Annotations[devopsv1alpha3.DevOpsCredentialDataHash] // don't need to check if it's nil, only compare if they're different
-			if specHash == oldHash {
-				// it was synced successfully, and there's any change with the Pipeline spec, skip this round
-				return nil
-			}
-			copySecret.Annotations[devopsv1alpha3.DevOpsCredentialDataHash] = specHash
-		}
-
 		// https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#finalizers
 		if !sliceutil.HasString(secret.ObjectMeta.Finalizers, devopsv1alpha3.CredentialFinalizerName) {
 			copySecret.ObjectMeta.Finalizers = append(copySecret.ObjectMeta.Finalizers, devopsv1alpha3.CredentialFinalizerName)
 		}
-		// Check secret config exists, otherwise we will create it.
-		// if secret exists, update config
+
+		// Check credential exists in Jenkins first, this handles the case when Jenkins is rebuilt
 		_, err := c.devopsClient.GetCredentialInProject(nsName, copySecret.Name)
-		if err == nil {
+		credentialExistsInJenkins := err == nil
+
+		// Calculate data hash for change detection
+		dataHash := utils.ComputeHash(copySecret.Data)
+		oldHash := copySecret.Annotations[devopsv1alpha3.DevOpsCredentialDataHash]
+		dataChanged := dataHash != oldHash
+
+		// If sync was successful, credential exists in Jenkins, and data hasn't changed, skip this round
+		if state, ok := copySecret.Annotations[devopsv1alpha3.CredentialSyncStatusAnnoKey]; ok && state == constants.StatusSuccessful {
+			if credentialExistsInJenkins && !dataChanged {
+				return nil
+			}
+		}
+
+		// Update data hash
+		copySecret.Annotations[devopsv1alpha3.DevOpsCredentialDataHash] = dataHash
+
+		// Sync credential to Jenkins: create if not exists, update if data differs
+		if credentialExistsInJenkins {
 			if _, ok := copySecret.Annotations[devopsv1alpha3.CredentialAutoSyncAnnoKey]; ok {
 				_, err := c.devopsClient.UpdateCredentialInProject(nsName, copySecret)
 				if err != nil {
 					klog.V(8).Info(err, fmt.Sprintf("failed to update secret %s ", key))
 					return err
 				}
+				klog.Infof("updated credential %s in Jenkins", key)
 			}
 		} else {
 			_, err = c.devopsClient.CreateCredentialInProject(nsName, copySecret)
@@ -277,7 +285,9 @@ func (c *Controller) syncHandler(key string) error {
 				klog.V(8).Info(err, fmt.Sprintf("failed to create secret %s ", key))
 				return err
 			}
+			klog.Infof("created credential %s in Jenkins (was missing)", key)
 		}
+
 		//If there is no early return, then the sync is successful.
 		copySecret.Annotations[devopsv1alpha3.CredentialSyncStatusAnnoKey] = constants.StatusSuccessful
 	} else {
