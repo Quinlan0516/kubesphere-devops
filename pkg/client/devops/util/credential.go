@@ -44,8 +44,11 @@ func ConvertSecretToCredential(secret *v1.Secret) (interface{}, error) {
 		secretContent := string(secret.Data[devopsv1alpha3.SecretTextSecretKey])
 		return jcredential.NewSecretTextCredential(name, secretContent), nil
 	case devopsv1alpha3.SecretTypeKubeConfig:
+		// Note: azure-kubernetes-credentials plugin (KubeconfigCredentials) has compatibility issues
+		// with Jenkins 2.568+. Using SecretText credential type instead, which works with
+		// withCredentials([string(...)]) in pipelines.
 		secretContent := string(secret.Data[devopsv1alpha3.KubeConfigSecretKey])
-		return jcredential.NewKubeConfigCredential(name, secretContent), nil
+		return jcredential.NewSecretTextCredential(name, secretContent), nil
 	default:
 		err := fmt.Errorf("error unsupport credential type")
 		return nil, restful.NewError(http.StatusBadRequest, err.Error())
